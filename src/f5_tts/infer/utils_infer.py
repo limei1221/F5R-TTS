@@ -8,17 +8,13 @@ sys.path.append(f"../../{os.path.dirname(os.path.abspath(__file__))}/third_party
 import hashlib
 import re
 import tempfile
-from importlib.resources import files
 
-import matplotlib
-
-matplotlib.use("Agg")
-
-import matplotlib.pylab as plt
 import numpy as np
 import torch
 import torchaudio
 import tqdm
+
+from importlib.resources import files
 from pydub import AudioSegment, silence
 from transformers import pipeline
 from vocos import Vocos
@@ -40,7 +36,6 @@ n_mel_channels = 100
 hop_length = 256
 win_length = 1024
 n_fft = 1024
-mel_spec_type = "vocos"
 target_rms = 0.1
 cross_fade_duration = 0.15
 ode_method = "euler"
@@ -49,6 +44,7 @@ cfg_strength = 2.0
 sway_sampling_coef = -1.0
 speed = 1.0
 fix_duration = None
+
 
 # -----------------------------------------
 
@@ -87,30 +83,9 @@ def chunk_text(text, max_chars=135):
 
 
 # load vocoder
-def load_vocoder(vocoder_name="vocos", is_local=False, local_path="", device=device):
-    if vocoder_name == "vocos":
-        if is_local:
-            print(f"Load vocos from local path {local_path}")
-            vocoder = Vocos.from_hparams(f"{local_path}/config.yaml")
-            state_dict = torch.load(f"{local_path}/pytorch_model.bin", map_location="cpu")
-            vocoder.load_state_dict(state_dict)
-            vocoder = vocoder.eval().to(device)
-        else:
-            print("Download Vocos from huggingface charactr/vocos-mel-24khz")
-            vocoder = Vocos.from_pretrained("charactr/vocos-mel-24khz").to(device)
-    elif vocoder_name == "bigvgan":
-        try:
-            from third_party.BigVGAN import bigvgan
-        except ImportError:
-            print("You need to follow the README to init submodule and change the BigVGAN source code.")
-        if is_local:
-            """download from https://huggingface.co/nvidia/bigvgan_v2_24khz_100band_256x/tree/main"""
-            vocoder = bigvgan.BigVGAN.from_pretrained(local_path, use_cuda_kernel=False)
-        else:
-            vocoder = bigvgan.BigVGAN.from_pretrained("nvidia/bigvgan_v2_24khz_100band_256x", use_cuda_kernel=False)
-
-        vocoder.remove_weight_norm()
-        vocoder = vocoder.eval().to(device)
+def load_vocoder(vocoder_name="vocos", device=device):
+    assert vocoder_name == "vocos"
+    vocoder = Vocos.from_pretrained("charactr/vocos-mel-24khz").to(device)
     return vocoder
 
 
@@ -143,6 +118,7 @@ def load_checkpoint(model, ckpt_path, device, dtype=None, use_ema=True):
         )
     model = model.to(dtype)
 
+    print('Loadding pretrained model from:', ckpt_path)
     ckpt_type = ckpt_path.split(".")[-1]
     if ckpt_type == "safetensors":
         from safetensors.torch import load_file
@@ -152,6 +128,7 @@ def load_checkpoint(model, ckpt_path, device, dtype=None, use_ema=True):
         checkpoint = torch.load(ckpt_path, weights_only=True)
 
     if use_ema:
+        print('Loading EMA model...')
         if ckpt_type == "safetensors":
             checkpoint = {"ema_model_state_dict": checkpoint}
         checkpoint["model_state_dict"] = {
@@ -160,17 +137,17 @@ def load_checkpoint(model, ckpt_path, device, dtype=None, use_ema=True):
             if k not in ["initted", "step"]
         }
 
-        # patch for backward compatibility, 305e3ea
-        for key in ["mel_spec.mel_stft.mel_scale.fb", "mel_spec.mel_stft.spectrogram.window"]:
-            if key in checkpoint["model_state_dict"]:
-                del checkpoint["model_state_dict"][key]
-
-        model.load_state_dict(checkpoint["model_state_dict"])
+        try:
+            model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        except Exception as e:
+            print(e)
+            model.load_state_dict(checkpoint["model_state_dict"], strict=False)
     else:
         if ckpt_type == "safetensors":
             checkpoint = {"model_state_dict": checkpoint}
         model.load_state_dict(checkpoint["model_state_dict"])
 
+    del checkpoint
     return model.to(device)
 
 
@@ -181,7 +158,6 @@ def load_model(
     model_cls,
     model_cfg,
     ckpt_path,
-    mel_spec_type=mel_spec_type,
     vocab_file="",
     ode_method=ode_method,
     use_ema=True,
@@ -204,7 +180,6 @@ def load_model(
             win_length=win_length,
             n_mel_channels=n_mel_channels,
             target_sample_rate=target_sample_rate,
-            mel_spec_type=mel_spec_type,
         ),
         odeint_kwargs=dict(
             method=ode_method,
@@ -212,8 +187,7 @@ def load_model(
         vocab_char_map=vocab_char_map,
     ).to(device)
 
-    dtype = torch.float32 if mel_spec_type == "bigvgan" else None
-    model = load_checkpoint(model, ckpt_path, device, dtype=dtype, use_ema=use_ema)
+    model = load_checkpoint(model, ckpt_path, device, use_ema=use_ema)
 
     return model
 
@@ -325,7 +299,6 @@ def infer_process(
     gen_text,
     model_obj,
     vocoder,
-    mel_spec_type=mel_spec_type,
     show_info=print,
     progress=tqdm,
     target_rms=target_rms,
@@ -351,7 +324,6 @@ def infer_process(
         gen_text_batches,
         model_obj,
         vocoder,
-        mel_spec_type=mel_spec_type,
         progress=progress,
         target_rms=target_rms,
         cross_fade_duration=cross_fade_duration,
@@ -373,7 +345,6 @@ def infer_batch_process(
     gen_text_batches,
     model_obj,
     vocoder,
-    mel_spec_type="vocos",
     progress=tqdm,
     target_rms=0.1,
     cross_fade_duration=0.15,
@@ -385,7 +356,7 @@ def infer_batch_process(
     device=None,
 ):
     audio, sr = ref_audio
-    if audio.shape[0] > 1:
+    if audio.shape[0] > 1:  # make sure mono inputs
         audio = torch.mean(audio, dim=0, keepdim=True)
 
     rms = torch.sqrt(torch.mean(torch.square(audio)))
@@ -429,10 +400,7 @@ def infer_batch_process(
             generated = generated.to(torch.float32)
             generated = generated[:, ref_audio_len:, :]
             generated_mel_spec = generated.permute(0, 2, 1)
-            if mel_spec_type == "vocos":
-                generated_wave = vocoder.decode(generated_mel_spec)
-            elif mel_spec_type == "bigvgan":
-                generated_wave = vocoder(generated_mel_spec)
+            generated_wave = vocoder.decode(generated_mel_spec)
             if rms < target_rms:
                 generated_wave = generated_wave * rms / target_rms
 
@@ -498,14 +466,3 @@ def remove_silence_for_generated_wav(filename):
         non_silent_wave += non_silent_seg
     aseg = non_silent_wave
     aseg.export(filename, format="wav")
-
-
-# save spectrogram
-
-
-def save_spectrogram(spectrogram, path):
-    plt.figure(figsize=(12, 4))
-    plt.imshow(spectrogram, origin="lower", aspect="auto")
-    plt.colorbar()
-    plt.savefig(path)
-    plt.close()

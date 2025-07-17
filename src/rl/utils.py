@@ -14,7 +14,12 @@ class Speaker_emb(Speaker):
     def extract_embedding_from_pcm(self, pcm: torch.Tensor, sample_rate: int):
         pcm = pcm.to(torch.float)
         if sample_rate != self.resample_rate:
-            pcm = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=self.resample_rate)(pcm)
+            resampler = torchaudio.transforms.Resample(
+                orig_freq=sample_rate, new_freq=self.resample_rate
+            )
+            # Move resampler to the same device as input tensor
+            resampler = resampler.to(pcm.device)
+            pcm = resampler(pcm)
         feats = self.compute_fbank(pcm, sample_rate=self.resample_rate, cmn=True)
         feats = feats.unsqueeze(0)
         feats = feats.to(self.device)
@@ -25,12 +30,14 @@ class Speaker_emb(Speaker):
         return outputs
 
 
-model_spk_dir = 'src/rl/wespeaker/chinese'
+# model_spk_dir = 'src/rl/wespeaker/chinese'
+# model_spk_dir = "src/rl/wespeaker/english"
+model_spk_dir = "src/rl/wespeaker/multilingual"
 model_spk = Speaker_emb(model_spk_dir)
 
 
 def test_spk():
-    current_file = 'xx.wav'
+    current_file = "xx.wav"
     wav, sample_rate = torchaudio.load(current_file)
     current_embedding = model_spk.extract_embedding_from_pcm(wav, sample_rate)
     print(current_embedding.size())
@@ -57,7 +64,7 @@ model_asr = AutoModel(model=model_asr_dir, device="cpu", disable_update=True)
 
 
 def test_asr():
-    current_file = 'xx.wav'
+    current_file = "xx.wav"
     pcm, _ = torchaudio.load(current_file)
     resampled_audio = [pcm[0]]
 
@@ -77,6 +84,8 @@ def get_asr(audios, sr):
     # audios -> (b, t)
     if sr != 16000:
         resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
+        # Move resampler to the same device as input tensor
+        resampler = resampler.to(audios.device)
         list_audios = [resampler(audios[i, :].unsqueeze(0))[0] for i in range(audios.size(0))]
     else:
         list_audios = [audios[i, :] for i in range(audios.size(0))]
@@ -94,7 +103,7 @@ def get_asr(audios, sr):
 
 
 def editDistance(r, h):
-    '''
+    """
     This function is to calculate the edit distance of reference sentence and the hypothesis sentence.
 
     Main algorithm used is dynamic programming.
@@ -102,8 +111,10 @@ def editDistance(r, h):
     Attributes:
         r -> the list of words produced by splitting reference sentence.
         h -> the list of words produced by splitting hypothesis sentence.
-    '''
-    d = numpy.zeros((len(r) + 1) * (len(h) + 1), dtype=numpy.uint8).reshape((len(r) + 1, len(h) + 1))
+    """
+    d = numpy.zeros((len(r) + 1) * (len(h) + 1), dtype=numpy.uint8).reshape(
+        (len(r) + 1, len(h) + 1)
+    )
     for i in range(len(r) + 1):
         d[i][0] = i
     for j in range(len(h) + 1):

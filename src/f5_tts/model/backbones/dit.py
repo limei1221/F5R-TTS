@@ -16,13 +16,13 @@ from torch import nn
 from x_transformers.x_transformers import RotaryEmbedding
 
 from f5_tts.model.modules import (
-    TimestepEmbedding,
+    AdaLayerNorm_Final,
     ConvNeXtV2Block,
     ConvPositionEmbedding,
     DiTBlock,
-    AdaLayerNormZero_Final,
-    precompute_freqs_cis,
+    TimestepEmbedding,
     get_pos_embed_indices,
+    precompute_freqs_cis,
 )
 
 
@@ -30,9 +30,11 @@ from f5_tts.model.modules import (
 
 
 class TextEmbedding(nn.Module):
-    def __init__(self, text_num_embeds, text_dim, conv_layers=0, conv_mult=2):
+    def __init__(self, text_num_embeds, text_dim, mask_padding=True, conv_layers=0, conv_mult=2):
         super().__init__()
         self.text_embed = nn.Embedding(text_num_embeds + 1, text_dim)  # use 0 as filler token
+
+        self.mask_padding = mask_padding  # mask filler and batch padding tokens or not
 
         if conv_layers > 0:
             self.extra_modeling = True
@@ -49,6 +51,8 @@ class TextEmbedding(nn.Module):
         text = text[:, :seq_len]  # curtail if character tokens are more than the mel spec tokens
         batch, text_len = text.shape[0], text.shape[1]
         text = F.pad(text, (0, seq_len - text_len), value=0)
+        if self.mask_padding:
+            text_mask = text == 0
 
         if drop_text:  # cfg for text
             text = torch.zeros_like(text)
@@ -64,7 +68,13 @@ class TextEmbedding(nn.Module):
             text = text + text_pos_embed
 
             # convnextv2 blocks
-            text = self.text_blocks(text)
+            if self.mask_padding:
+                text = text.masked_fill(text_mask.unsqueeze(-1).expand(-1, -1, text.size(-1)), 0.0)
+                for block in self.text_blocks:
+                    text = block(text)
+                    text = text.masked_fill(text_mask.unsqueeze(-1).expand(-1, -1, text.size(-1)), 0.0)
+            else:
+                text = self.text_blocks(text)
 
         return text
 
@@ -103,15 +113,24 @@ class DiT(nn.Module):
         mel_dim=100,
         text_num_embeds=256,
         text_dim=None,
+        text_mask_padding=True,
+        qk_norm=None,
         conv_layers=0,
+        pe_attn_head=None,
+        attn_backend="torch",  # "torch" | "flash_attn"
+        attn_mask_enabled=False,
         long_skip_connection=False,
+        checkpoint_activations=False,
     ):
         super().__init__()
 
         self.time_embed = TimestepEmbedding(dim)
         if text_dim is None:
             text_dim = mel_dim
-        self.text_embed = TextEmbedding(text_num_embeds, text_dim, conv_layers=conv_layers)
+        self.text_embed = TextEmbedding(
+            text_num_embeds, text_dim, mask_padding=text_mask_padding, conv_layers=conv_layers
+        )
+        self.text_cond, self.text_uncond = None, None  # text cache
         self.input_embed = InputEmbedding(mel_dim, text_dim, dim)
 
         self.rotary_embed = RotaryEmbedding(dim_head)
@@ -120,13 +139,79 @@ class DiT(nn.Module):
         self.depth = depth
 
         self.transformer_blocks = nn.ModuleList(
-            [DiTBlock(dim=dim, heads=heads, dim_head=dim_head, ff_mult=ff_mult, dropout=dropout) for _ in range(depth)]
+            [
+                DiTBlock(
+                    dim=dim,
+                    heads=heads,
+                    dim_head=dim_head,
+                    ff_mult=ff_mult,
+                    dropout=dropout,
+                    qk_norm=qk_norm,
+                    pe_attn_head=pe_attn_head,
+                    attn_backend=attn_backend,
+                    attn_mask_enabled=attn_mask_enabled,
+                )
+                for _ in range(depth)
+            ]
         )
         self.long_skip_connection = nn.Linear(dim * 2, dim, bias=False) if long_skip_connection else None
 
-        self.norm_out = AdaLayerNormZero_Final(dim)  # final modulation
+        self.norm_out = AdaLayerNorm_Final(dim)  # final modulation
         self.proj_out = nn.Linear(dim, mel_dim)
+
+        self.checkpoint_activations = checkpoint_activations
         self.proj_out_ln_sig = nn.Linear(dim, mel_dim)
+
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        # Zero-out AdaLN layers in DiT blocks:
+        for block in self.transformer_blocks:
+            nn.init.constant_(block.attn_norm.linear.weight, 0)
+            nn.init.constant_(block.attn_norm.linear.bias, 0)
+
+        # Zero-out output layers:
+        nn.init.constant_(self.norm_out.linear.weight, 0)
+        nn.init.constant_(self.norm_out.linear.bias, 0)
+        nn.init.constant_(self.proj_out.weight, 0)
+        nn.init.constant_(self.proj_out.bias, 0)
+
+    def ckpt_wrapper(self, module):
+        # https://github.com/chuanyangjin/fast-DiT/blob/main/models.py
+        def ckpt_forward(*inputs):
+            outputs = module(*inputs)
+            return outputs
+
+        return ckpt_forward
+
+    def get_input_embed(
+        self,
+        x,  # b n d
+        cond,  # b n d
+        text,  # b nt
+        drop_audio_cond: bool = False,
+        drop_text: bool = False,
+        cache: bool = True,
+    ):
+        seq_len = x.shape[1]
+        if cache:
+            if drop_text:
+                if self.text_uncond is None:
+                    self.text_uncond = self.text_embed(text, seq_len, drop_text=True)
+                text_embed = self.text_uncond
+            else:
+                if self.text_cond is None:
+                    self.text_cond = self.text_embed(text, seq_len, drop_text=False)
+                text_embed = self.text_cond
+        else:
+            text_embed = self.text_embed(text, seq_len, drop_text=drop_text)
+
+        x = self.input_embed(x, cond, text_embed, drop_audio_cond=drop_audio_cond)
+
+        return x
+
+    def clear_cache(self):
+        self.text_cond, self.text_uncond = None, None
 
     def forward(
         self,
@@ -134,18 +219,26 @@ class DiT(nn.Module):
         cond: float["b n d"],  # masked cond audio  # noqa: F722
         text: int["b nt"],  # text  # noqa: F722
         time: float["b"] | float[""],  # time step  # noqa: F821 F722
-        drop_audio_cond,  # cfg for cond audio
-        drop_text,  # cfg for text
         mask: bool["b n"] | None = None,  # noqa: F722
+        drop_audio_cond: bool = False,  # cfg for cond audio
+        drop_text: bool = False,  # cfg for text
+        cfg_infer: bool = False,  # cfg inference, pack cond & uncond forward
+        cache: bool = False,
     ):
         batch, seq_len = x.shape[0], x.shape[1]
         if time.ndim == 0:
             time = time.repeat(batch)
 
-        # t: conditioning time, c: context (text + masked cond audio), x: noised input audio
+        # t: conditioning time, text: text, x: noised audio + cond audio + text
         t = self.time_embed(time)
-        text_embed = self.text_embed(text, seq_len, drop_text=drop_text)
-        x = self.input_embed(x, cond, text_embed, drop_audio_cond=drop_audio_cond)
+        if cfg_infer:  # pack cond & uncond forward: b n d -> 2b n d
+            x_cond = self.get_input_embed(x, cond, text, drop_audio_cond=False, drop_text=False, cache=cache)
+            x_uncond = self.get_input_embed(x, cond, text, drop_audio_cond=True, drop_text=True, cache=cache)
+            x = torch.cat((x_cond, x_uncond), dim=0)
+            t = torch.cat((t, t), dim=0)
+            mask = torch.cat((mask, mask), dim=0) if mask is not None else None
+        else:
+            x = self.get_input_embed(x, cond, text, drop_audio_cond=drop_audio_cond, drop_text=drop_text, cache=cache)
 
         rope = self.rotary_embed.forward_from_seq_len(seq_len)
 
@@ -153,7 +246,11 @@ class DiT(nn.Module):
             residual = x
 
         for block in self.transformer_blocks:
-            x = block(x, t, mask=mask, rope=rope)
+            if self.checkpoint_activations:
+                # https://pytorch.org/docs/stable/checkpoint.html#torch.utils.checkpoint.checkpoint
+                x = torch.utils.checkpoint.checkpoint(self.ckpt_wrapper(block), x, t, mask, rope, use_reentrant=False)
+            else:
+                x = block(x, t, mask=mask, rope=rope)
 
         if self.long_skip_connection is not None:
             x = self.long_skip_connection(torch.cat((x, residual), dim=-1))
@@ -166,13 +263,15 @@ class DiT(nn.Module):
 
     def inference(
         self,
-        x,     # nosied input audio float['b n d']
-        cond,  # masked cond audio float['b n d']
-        text,  # text int['b nt']
-        time,  # time step float['b'] | float['']
-        drop_audio_cond,  # cfg for cond audio
-        drop_text,        # cfg for text
-        mask=None,  # bool['b n'] | None
+        x: float["b n d"],  # nosied input audio  # noqa: F722
+        cond: float["b n d"],  # masked cond audio  # noqa: F722
+        text: int["b nt"],  # text  # noqa: F722
+        time: float["b"] | float[""],  # time step  # noqa: F821 F722
+        mask: bool["b n"] | None = None,  # noqa: F722
+        drop_audio_cond: bool = False,  # cfg for cond audio
+        drop_text: bool = False,  # cfg for text
+        cfg_infer: bool = False,  # cfg inference, pack cond & uncond forward
+        cache: bool = False,
     ):
         batch, seq_len = x.shape[0], x.shape[1]
         if time.ndim == 0:
@@ -183,7 +282,15 @@ class DiT(nn.Module):
         time = time.to(cond.dtype)
         t = self.time_embed(time)
         text_embed = self.text_embed(text, seq_len, drop_text=drop_text)
-        x = self.input_embed(x, cond, text_embed, drop_audio_cond=drop_audio_cond)
+        t = self.time_embed(time)
+        if cfg_infer:  # pack cond & uncond forward: b n d -> 2b n d
+            x_cond = self.get_input_embed(x, cond, text, drop_audio_cond=False, drop_text=False, cache=cache)
+            x_uncond = self.get_input_embed(x, cond, text, drop_audio_cond=True, drop_text=True, cache=cache)
+            x = torch.cat((x_cond, x_uncond), dim=0)
+            t = torch.cat((t, t), dim=0)
+            mask = torch.cat((mask, mask), dim=0) if mask is not None else None
+        else:
+            x = self.get_input_embed(x, cond, text, drop_audio_cond=drop_audio_cond, drop_text=drop_text, cache=cache)
 
         rope = self.rotary_embed.forward_from_seq_len(seq_len)
 
@@ -206,13 +313,15 @@ class DiT(nn.Module):
 
     def forward_rl(
         self,
-        x,  # nosied input audio float['b n d']
-        cond,  # masked cond audio float['b n d']
-        text,  # text int['b nt']
-        time,  # time step float['b']
-        drop_audio_cond,  # cfg for cond audio
-        drop_text,   # cfg for text
-        mask=None,  # bool['b n'] | None
+        x: float["b n d"],  # nosied input audio  # noqa: F722
+        cond: float["b n d"],  # masked cond audio  # noqa: F722
+        text: int["b nt"],  # text  # noqa: F722
+        time: float["b"] | float[""],  # time step  # noqa: F821 F722
+        mask: bool["b n"] | None = None,  # noqa: F722
+        drop_audio_cond: bool = False,  # cfg for cond audio
+        drop_text: bool = False,  # cfg for text
+        cfg_infer: bool = False,  # cfg inference, pack cond & uncond forward
+        cache: bool = False,
     ):
         batch, seq_len = x.shape[0], x.shape[1]
         if time.ndim == 0:
@@ -220,8 +329,14 @@ class DiT(nn.Module):
 
         # t: conditioning time, c: context (text + masked cond audio), x: noised input audio
         t = self.time_embed(time)
-        text_embed = self.text_embed(text, seq_len, drop_text=drop_text)
-        x = self.input_embed(x, cond, text_embed, drop_audio_cond=drop_audio_cond)
+        if cfg_infer:  # pack cond & uncond forward: b n d -> 2b n d
+            x_cond = self.get_input_embed(x, cond, text, drop_audio_cond=False, drop_text=False, cache=cache)
+            x_uncond = self.get_input_embed(x, cond, text, drop_audio_cond=True, drop_text=True, cache=cache)
+            x = torch.cat((x_cond, x_uncond), dim=0)
+            t = torch.cat((t, t), dim=0)
+            mask = torch.cat((mask, mask), dim=0) if mask is not None else None
+        else:
+            x = self.get_input_embed(x, cond, text, drop_audio_cond=drop_audio_cond, drop_text=drop_text, cache=cache)
 
         rope = self.rotary_embed.forward_from_seq_len(seq_len)
 

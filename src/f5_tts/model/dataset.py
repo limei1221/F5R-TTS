@@ -1,5 +1,4 @@
 import json
-import random
 from importlib.resources import files
 
 import torch
@@ -7,13 +6,19 @@ import torch.nn.functional as F
 import torchaudio
 from datasets import Dataset as Dataset_
 from datasets import load_from_disk
+from einops import rearrange
 from torch import nn
-from torch.utils.data import Dataset, Sampler
+from torch.utils.data import Dataset, Sampler, IterableDataset
 from tqdm import tqdm
 
 from f5_tts.model.modules import MelSpec
-from f5_tts.model.utils import default
+from f5_tts.model.utils import default, convert_char_to_pinyin
 
+MIN_DURATION = 1
+MAX_DURATION = 16  # 16 * 24000 / 256 = 1500 frames
+
+# MIN_DURATION = 1
+# MAX_DURATION = 6  # 6 * 24000 / 256 = 562 frames
 
 class HFDataset(Dataset):
     def __init__(
@@ -24,7 +29,6 @@ class HFDataset(Dataset):
         hop_length=256,
         n_fft=1024,
         win_length=1024,
-        mel_spec_type="vocos",
     ):
         self.data = hf_dataset
         self.target_sample_rate = target_sample_rate
@@ -36,8 +40,8 @@ class HFDataset(Dataset):
             win_length=win_length,
             n_mel_channels=n_mel_channels,
             target_sample_rate=target_sample_rate,
-            mel_spec_type=mel_spec_type,
         )
+        self.streaming = False
 
     def get_frame_len(self, index):
         row = self.data[index]
@@ -51,13 +55,10 @@ class HFDataset(Dataset):
     def __getitem__(self, index):
         row = self.data[index]
         audio = row["audio"]["array"]
-
-        # logger.info(f"Audio shape: {audio.shape}")
-
         sample_rate = row["audio"]["sampling_rate"]
         duration = audio.shape[-1] / sample_rate
 
-        if duration > 30 or duration < 0.3:
+        if duration > MAX_DURATION or duration < MIN_DURATION:
             return self.__getitem__((index + 1) % len(self.data))
 
         audio_tensor = torch.from_numpy(audio).float()
@@ -72,12 +73,87 @@ class HFDataset(Dataset):
 
         mel_spec = mel_spec.squeeze(0)  # '1 d t -> d t'
 
-        text = row["text"]
+        text = row["text_normalized"]
 
         return dict(
             mel_spec=mel_spec,
             text=text,
         )
+
+
+class StreamingHFDataset(IterableDataset):
+    def __init__(
+        self,
+        hf_dataset: Dataset,
+        target_sample_rate=24_000,
+        n_mel_channels=100,
+        hop_length=256,
+        n_fft=1024,
+        win_length=1024,
+    ):
+        self.data = hf_dataset
+        self.target_sample_rate = target_sample_rate
+        self.hop_length = hop_length
+        self.mel_spectrogram = MelSpec(
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=win_length,
+            n_mel_channels=n_mel_channels,
+            target_sample_rate=target_sample_rate,
+        )
+        self.streaming = True
+
+    def __len__(self):
+        return None
+
+    def __process_row(self, row):
+        # # for LibriTTS dataset
+        # audio = row["audio"]["array"]
+        # sample_rate = row["audio"]["sampling_rate"]
+
+        # for Emilia dataset
+        audio = row["mp3"]["array"]
+        sample_rate = row["mp3"]["sampling_rate"]
+
+        duration = audio.shape[-1] / sample_rate
+
+        audio_tensor = torch.from_numpy(audio).float()
+
+        if sample_rate != self.target_sample_rate:
+            resampler = torchaudio.transforms.Resample(
+                sample_rate, self.target_sample_rate
+            )
+            audio_tensor = resampler(audio_tensor)
+
+        audio_tensor = rearrange(audio_tensor, "t -> 1 t")
+
+        mel_spec = self.mel_spectrogram(audio_tensor)
+
+        mel_spec = rearrange(mel_spec, "1 d t -> d t")
+
+        # # for LibriTTS dataset
+        # text = row["text_normalized"]
+
+        # for Emilia dataset
+        text = row["json"]["text"]
+
+        text = convert_char_to_pinyin([text])
+        text = "".join(text[0])
+
+        return mel_spec, text, duration
+
+    def __iter__(self):
+        for row in self.data:
+            mel_spec, text, duration = self.__process_row(row)
+
+            if duration > MAX_DURATION or duration < MIN_DURATION:
+                continue
+
+            # print(f"text: {text}")
+            yield dict(
+                mel_spec=mel_spec,
+                text=text,
+            )
 
 
 class CustomDataset(Dataset):
@@ -90,7 +166,6 @@ class CustomDataset(Dataset):
         n_mel_channels=100,
         n_fft=1024,
         win_length=1024,
-        mel_spec_type="vocos",
         preprocessed_mel=False,
         mel_spec_module: nn.Module | None = None,
     ):
@@ -100,8 +175,8 @@ class CustomDataset(Dataset):
         self.hop_length = hop_length
         self.n_fft = n_fft
         self.win_length = win_length
-        self.mel_spec_type = mel_spec_type
         self.preprocessed_mel = preprocessed_mel
+        self.streaming = False
 
         if not preprocessed_mel:
             self.mel_spectrogram = default(
@@ -112,7 +187,6 @@ class CustomDataset(Dataset):
                     win_length=win_length,
                     n_mel_channels=n_mel_channels,
                     target_sample_rate=target_sample_rate,
-                    mel_spec_type=mel_spec_type,
                 ),
             )
 
@@ -127,54 +201,75 @@ class CustomDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, index):
-        row = self.data[index]
-        audio_path = row["audio_path"]
-        text = row["text"]
-        duration = row["duration"]
+        while True:
+            row = self.data[index]
+            audio_path = row["audio_path"]
+            text = row["text"]
+            duration = row["duration"]
+
+            # filter by given length
+            if MIN_DURATION <= duration <= MAX_DURATION:
+                break  # valid
+
+            index = (index + 1) % len(self.data)
 
         if self.preprocessed_mel:
             mel_spec = torch.tensor(row["mel_spec"])
-
         else:
             audio, source_sample_rate = torchaudio.load(audio_path)
+
+            # make sure mono input
             if audio.shape[0] > 1:
                 audio = torch.mean(audio, dim=0, keepdim=True)
 
-            if duration > 15 or duration < 0.3:
-                return self.__getitem__((index + 1) % len(self.data))
-
+            # resample if necessary
             if source_sample_rate != self.target_sample_rate:
                 resampler = torchaudio.transforms.Resample(source_sample_rate, self.target_sample_rate)
                 audio = resampler(audio)
 
+            # to mel spectrogram
             mel_spec = self.mel_spectrogram(audio)
-            mel_spec = mel_spec.squeeze(0)  # '1 d t -> d t')
+            mel_spec = mel_spec.squeeze(0)  # '1 d t -> d t'
 
-        return dict(
-            mel_spec=mel_spec,
-            text=text,
-        )
+        # print(f"text: {text}")
+        return {
+            "mel_spec": mel_spec,
+            "text": text,
+        }
 
 
 # Dynamic Batch Sampler
-
-
 class DynamicBatchSampler(Sampler[list[int]]):
+    """Extension of Sampler that will do the following:
+    1.  Change the batch size (essentially number of sequences)
+        in a batch to ensure that the total number of frames are less
+        than a certain threshold.
+    2.  Make sure the padding efficiency in the batch is high.
+    3.  Shuffle batches each epoch while maintaining reproducibility.
+    """
+
     def __init__(
-        self, sampler: Sampler[int], frames_threshold: int, max_samples=0, random_seed=None, drop_last: bool = False,
-        repeat_count=1, mini_repeat_count=1
+        self,
+        sampler: Sampler[int],
+        frames_threshold: int,
+        min_samples=0,
+        max_samples=0,
+        random_seed=None,
+        drop_residual: bool = False,
     ):
         self.sampler = sampler
         self.frames_threshold = frames_threshold
+        self.min_samples = min_samples
         self.max_samples = max_samples
-        self.repeat_count = repeat_count
-        self.mini_repeat_count = mini_repeat_count
+        self.random_seed = random_seed
+        self.epoch = 0
 
         indices, batches = [], []
         data_source = self.sampler.data_source
 
         for idx in tqdm(
-            self.sampler, desc="Sorting with sampler... if slow, check whether dataset is provided with duration"
+            self.sampler,
+            desc="Sorting with sampler... if slow, check whether dataset is provided with duration",
         ):
             indices.append((idx, data_source.get_frame_len(idx)))
         indices.sort(key=lambda elem: elem[1])
@@ -184,7 +279,7 @@ class DynamicBatchSampler(Sampler[list[int]]):
         for idx, frame_len in tqdm(
             indices, desc=f"Creating dynamic batches with {frames_threshold} audio frames per gpu"
         ):
-            if batch_frames + frame_len <= self.frames_threshold and (max_samples == 0 or len(batch) < max_samples):
+            if (batch_frames + frame_len <= self.frames_threshold and (max_samples == 0 or len(batch) < max_samples)) or (len(batch) < min_samples):
                 batch.append(idx)
                 batch_frames += frame_len
             else:
@@ -197,29 +292,27 @@ class DynamicBatchSampler(Sampler[list[int]]):
                     batch = []
                     batch_frames = 0
 
-        if not drop_last and len(batch) > 0:
+        if not drop_residual and len(batch) > 0:
             batches.append(batch)
 
         del indices
+        self.batches = batches
 
-        # if want to have different batches between epochs, may just set a seed and log it in ckpt
-        # cuz during multi-gpu training, although the batch on per gpu not change between epochs, the formed general minibatch is different
-        # e.g. for epoch n, use (random_seed + n)
-        random.seed(random_seed)
-        random.shuffle(batches)
-
-        # repeat
-        self.batches = []
-        for chunk in batches:
-            for _ in range(self.repeat_count):
-                batch_sub = []
-                for index in chunk:
-                    for _ in range(self.mini_repeat_count):
-                        batch_sub.append(index)
-                self.batches.append(batch_sub)
+    def set_epoch(self, epoch: int) -> None:
+        """Sets the epoch for this sampler."""
+        self.epoch = epoch
 
     def __iter__(self):
-        return iter(self.batches)
+        # Use both random_seed and epoch for deterministic but different shuffling per epoch
+        if self.random_seed is not None:
+            g = torch.Generator()
+            g.manual_seed(self.random_seed + self.epoch)
+            # Use PyTorch's random permutation for better reproducibility across PyTorch versions
+            indices = torch.randperm(len(self.batches), generator=g).tolist()
+            batches = [self.batches[i] for i in indices]
+        else:
+            batches = self.batches
+        return iter(batches)
 
     def __len__(self):
         return len(self.batches)
@@ -278,16 +371,6 @@ def load_dataset(
             train_dataset, durations=durations, preprocessed_mel=preprocessed_mel, **mel_spec_kwargs
         )
 
-    elif dataset_type == "HFDataset":
-        print(
-            "Should manually modify the path of huggingface dataset to your need.\n"
-            + "May also the corresponding script cuz different dataset may have different format."
-        )
-        pre, post = dataset_name.split("_")
-        train_dataset = HFDataset(
-            load_dataset(f"{pre}/{pre}", split=f"train.{post}", cache_dir=str(files("f5_tts").joinpath("../../data"))),
-        )
-
     return train_dataset
 
 
@@ -300,7 +383,7 @@ def collate_fn(batch):
     max_mel_length = mel_lengths.amax()
 
     padded_mel_specs = []
-    for spec in mel_specs:  # TODO. maybe records mask for attention here
+    for spec in mel_specs:
         padding = (0, max_mel_length - spec.size(-1))
         padded_spec = F.pad(spec, padding, value=0)
         padded_mel_specs.append(padded_spec)
@@ -312,7 +395,7 @@ def collate_fn(batch):
 
     return dict(
         mel=mel_specs,
-        mel_lengths=mel_lengths,
+        mel_lengths=mel_lengths,  # records for padding mask
         text=text,
         text_lengths=text_lengths,
     )

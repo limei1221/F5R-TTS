@@ -9,12 +9,12 @@ d - dimension
 
 from __future__ import annotations
 
-from einops import rearrange
 from random import random
 from typing import Callable
 
 import torch
 import torch.nn.functional as F
+from einops import rearrange
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from torchdiffeq import odeint
@@ -23,6 +23,7 @@ from f5_tts.model.modules import MelSpec
 from f5_tts.model.utils import (
     default,
     exists,
+    get_epss_timesteps,
     lens_to_mask,
     list_str_to_idx,
     list_str_to_tensor,
@@ -39,7 +40,7 @@ class CFM(nn.Module):
         odeint_kwargs: dict = dict(
             # atol = 1e-5,
             # rtol = 1e-5,
-            method="euler"  # 'midpoint'
+            method="euler"  # 'euler', 'midpoint', 'rk4'
         ),
         audio_drop_prob=0.3,
         cond_drop_prob=0.2,
@@ -93,7 +94,7 @@ class CFM(nn.Module):
         sway_sampling_coef=None,
         seed: int | None = None,
         max_duration=4096,
-        vocoder: Callable[[float["b d n"]], float["b nw"]] | None = None,  # noqa: F722
+        use_epss=True,
         no_ref_audio=False,
         duplicate_test=False,
         t_inter=0.1,
@@ -104,7 +105,7 @@ class CFM(nn.Module):
 
         if cond.ndim == 2:
             cond = self.mel_spec(cond)
-            cond = cond.permute(0, 2, 1)
+            cond = cond.permute(0, 2, 1)  # [b, d, n] -> [b, n, d]
             assert cond.shape[-1] == self.num_channels
 
         cond = cond.to(next(self.parameters()).dtype)
@@ -122,10 +123,6 @@ class CFM(nn.Module):
                 text = list_str_to_tensor(text).to(device)
             assert text.shape[0] == batch
 
-        if exists(text):
-            text_lens = (text != -1).sum(dim=-1)
-            lens = torch.maximum(text_lens, lens)  # make sure lengths are at least those of the text characters
-
         # duration
 
         cond_mask = lens_to_mask(lens)
@@ -135,7 +132,9 @@ class CFM(nn.Module):
         if isinstance(duration, int):
             duration = torch.full((batch,), duration, device=device, dtype=torch.long)
 
-        duration = torch.maximum(lens + 1, duration)  # just add one token so something is generated
+        duration = torch.maximum(
+            torch.maximum((text != -1).sum(dim=-1), lens) + 1, duration
+        )  # duration at least text/audio prompt length plus one token, so something is generated
         duration = duration.clamp(max=max_duration)
         max_duration = duration.amax()
 
@@ -144,6 +143,9 @@ class CFM(nn.Module):
             test_cond = F.pad(cond, (0, 0, cond_seq_len, max_duration - 2 * cond_seq_len), value=0.0)
 
         cond = F.pad(cond, (0, 0, 0, max_duration - cond_seq_len), value=0.0)
+        if no_ref_audio:
+            cond = torch.zeros_like(cond)
+
         cond_mask = F.pad(cond_mask, (0, max_duration - cond_mask.shape[-1]), value=False)
         cond_mask = cond_mask.unsqueeze(-1)
         step_cond = torch.where(
@@ -155,26 +157,37 @@ class CFM(nn.Module):
         else:  # save memory and speed up, as single inference need no mask currently
             mask = None
 
-        # test for no ref audio
-        if no_ref_audio:
-            cond = torch.zeros_like(cond)
-
         # neural ode
 
         def fn(t, x):
             # at each step, conditioning is fixed
             # step_cond = torch.where(cond_mask, cond, torch.zeros_like(cond))
 
-            # predict flow
-            pred = self.transformer.inference(
-                x=x, cond=step_cond, text=text, time=t, mask=mask, drop_audio_cond=False, drop_text=False
-            )
+            # predict flow (cond)
             if cfg_strength < 1e-5:
+                pred = self.transformer.inference(
+                    x=x,
+                    cond=step_cond,
+                    text=text,
+                    time=t,
+                    mask=mask,
+                    drop_audio_cond=False,
+                    drop_text=False,
+                    cache=True,
+                )
                 return pred
 
-            null_pred = self.transformer.inference(
-                x=x, cond=step_cond, text=text, time=t, mask=mask, drop_audio_cond=True, drop_text=True
+            # predict flow (cond and uncond), for classifier-free guidance
+            pred_cfg = self.transformer.inference(
+                x=x,  # noise
+                cond=step_cond,  # (1 - mask) * cond
+                text=text,
+                time=t,
+                mask=mask,
+                cfg_infer=True,
+                cache=True,
             )
+            pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
             return pred + (pred - null_pred) * cfg_strength
 
         # noise input
@@ -195,19 +208,19 @@ class CFM(nn.Module):
             y0 = (1 - t_start) * y0 + t_start * test_cond
             steps = int(steps * (1 - t_start))
 
-        t = torch.linspace(t_start, 1, steps + 1, device=self.device, dtype=step_cond.dtype)
+        if t_start == 0 and use_epss:  # use Empirically Pruned Step Sampling for low NFE
+            t = get_epss_timesteps(steps, device=self.device, dtype=step_cond.dtype)
+        else:
+            t = torch.linspace(t_start, 1, steps + 1, device=self.device, dtype=step_cond.dtype)
         if sway_sampling_coef is not None:
             t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
 
         trajectory = odeint(fn, y0, t, **self.odeint_kwargs)
+        self.transformer.clear_cache()
 
         sampled = trajectory[-1]
-        out = sampled
+        out = sampled  # [b, n, d]
         out = torch.where(cond_mask, cond, out)
-
-        if exists(vocoder):
-            out = out.permute(0, 2, 1)
-            out = vocoder(out)
 
         return out, trajectory
 
@@ -260,11 +273,11 @@ class CFM(nn.Module):
 
         # sample xt (φ_t(x) in the paper)
         t = time.unsqueeze(-1).unsqueeze(-1)
-        φ = (1 - t) * x0 + t * x1
+        φ = (1 - t) * x0 + t * x1  # x_t, noisy speech
         flow = x1 - x0
 
         # only predict what is within the random mask span for infilling
-        cond = torch.where(rand_span_mask[..., None], torch.zeros_like(x1), x1)
+        cond = torch.where(rand_span_mask[..., None], torch.zeros_like(x1), x1)  # masked speech
 
         # transformer and cfg training with a drop rate
         drop_audio_cond = random() < self.audio_drop_prob  # p_drop in voicebox paper
@@ -274,15 +287,18 @@ class CFM(nn.Module):
         else:
             drop_text = False
 
-        # if want rigourously mask out padding, record in collate_fn in dataset.py, and pass in here
-        # adding mask will use more memory, thus also need to adjust batchsampler with scaled down threshold for long sequences
+        # apply mask will use more memory; might adjust batchsize or batchsampler long sequence threshold
         mu, ln_sig = self.transformer(
-            x=φ, cond=cond, text=text, time=time,
-            drop_audio_cond=drop_audio_cond, drop_text=drop_text
+            x=φ, cond=cond, text=text, time=time, drop_audio_cond=drop_audio_cond, drop_text=drop_text, mask=mask,
         )
 
         # flow matching loss
-        loss = F.mse_loss(mu, flow, reduction='none') / (2 * (torch.exp(ln_sig) ** 2) + 1e-6) + ln_sig
+        # loss = F.mse_loss(pred, flow, reduction="none")
+        loss = (
+            F.mse_loss(mu, flow, reduction="none")
+            / (2 * (torch.exp(ln_sig) ** 2) + 1e-6)
+            + ln_sig
+        )
         loss += (t * t) * ln_sig
         loss = loss[rand_span_mask]
 
@@ -296,11 +312,10 @@ class CFM(nn.Module):
         *,
         lens=None,  # int['b'] | None
         steps=32,
-        cfg_strength=1.,
+        cfg_strength=1.0,
         sway_sampling_coef=None,
         seed: int | None = None,
         max_duration=4096,
-        vocoder=None,  # Callable[[float['b d n']], float['b nw']] | None
         no_ref_audio=False,
         duplicate_test=False,
         t_inter=0.1,
@@ -323,7 +338,9 @@ class CFM(nn.Module):
 
         if exists(text):
             text_lens = (text != -1).sum(dim=-1)
-            lens = torch.maximum(text_lens, lens)  # make sure lengths are at least those of the text characters
+            lens = torch.maximum(
+                text_lens, lens
+            )  # make sure lengths are at least those of the text characters
 
         # duration
 
@@ -334,17 +351,23 @@ class CFM(nn.Module):
         if isinstance(duration, int):
             duration = torch.full((batch,), duration, device=device, dtype=torch.long)
 
-        duration = torch.maximum(lens + 1, duration)  # just add one token so something is generated
+        duration = torch.maximum(
+            lens + 1, duration
+        )  # just add one token so something is generated
         duration = duration.clamp(max=max_duration)
         max_duration = duration.amax()
 
         # duplicate test corner for inner time step oberservation
         if duplicate_test:
-            test_cond = F.pad(cond, (0, 0, cond_seq_len, max_duration - 2 * cond_seq_len), value=0.)
+            test_cond = F.pad(
+                cond, (0, 0, cond_seq_len, max_duration - 2 * cond_seq_len), value=0.0
+            )
 
-        cond = F.pad(cond, (0, 0, 0, max_duration - cond_seq_len), value=0.)
-        cond_mask = F.pad(cond_mask, (0, max_duration - cond_mask.shape[-1]), value=False)
-        cond_mask = rearrange(cond_mask, '... -> ... 1')
+        cond = F.pad(cond, (0, 0, 0, max_duration - cond_seq_len), value=0.0)
+        cond_mask = F.pad(
+            cond_mask, (0, max_duration - cond_mask.shape[-1]), value=False
+        )
+        cond_mask = rearrange(cond_mask, "... -> ... 1")
         # allow direct control (cut cond audio) with lens passed in
         step_cond = torch.where(cond_mask, cond, torch.zeros_like(cond))
 
@@ -365,15 +388,25 @@ class CFM(nn.Module):
 
             # predict flow
             pred, mu, log_sig = self.transformer.forward_rl(
-                x=x, cond=step_cond, text=text, time=t, mask=mask,
-                drop_audio_cond=False, drop_text=False
+                x=x,
+                cond=step_cond,
+                text=text,
+                time=t,
+                mask=mask,
+                drop_audio_cond=False,
+                drop_text=False,
             )
             if cfg_strength < 1e-5:
                 return pred
 
             null_pred, _, _ = self.transformer.forward_rl(
-                x=x, cond=step_cond, text=text, time=t, mask=mask,
-                drop_audio_cond=True, drop_text=True
+                x=x,
+                cond=step_cond,
+                text=text,
+                time=t,
+                mask=mask,
+                drop_audio_cond=True,
+                drop_text=True,
             )
             return pred + (pred - null_pred) * cfg_strength, mu, log_sig
 
@@ -384,7 +417,11 @@ class CFM(nn.Module):
         for dur in duration:
             if exists(seed):
                 torch.manual_seed(seed)
-            y0.append(torch.randn(dur, self.num_channels, device=self.device))
+            y0.append(
+                torch.randn(
+                    dur, self.num_channels, device=self.device, dtype=step_cond.dtype
+                )
+            )
         y0 = pad_sequence(y0, padding_value=0, batch_first=True)
 
         t_start = 0
@@ -404,9 +441,5 @@ class CFM(nn.Module):
         sampled = trajectory[-1]
         out = sampled
         out = torch.where(cond_mask, cond, out)
-
-        if exists(vocoder):
-            out = rearrange(out, 'b n d -> b d n')
-            out = vocoder(out)
 
         return out, trajectory, pro_result

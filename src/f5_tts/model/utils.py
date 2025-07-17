@@ -5,11 +5,10 @@ import random
 from collections import defaultdict
 from importlib.resources import files
 
-import torch
-from torch.nn.utils.rnn import pad_sequence
-
 import jieba
-from pypinyin import lazy_pinyin, Style
+import torch
+from pypinyin import Style, lazy_pinyin
+from torch.nn.utils.rnn import pad_sequence
 
 
 # seed everything
@@ -34,6 +33,16 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+
+def is_package_available(package_name: str) -> bool:
+    try:
+        import importlib
+
+        package_exists = importlib.util.find_spec(package_name) is not None
+        return package_exists
+    except Exception:
+        return False
 
 
 # tensor helpers
@@ -110,6 +119,7 @@ def get_tokenizer(dataset_name, tokenizer: str = "pinyin"):
     """
     if tokenizer in ["pinyin", "char"]:
         tokenizer_path = os.path.join(files("f5_tts").joinpath("../../data"), f"{dataset_name}_{tokenizer}/vocab.txt")
+        print('Using vocab.txt from:', tokenizer_path)
         with open(tokenizer_path, "r", encoding="utf-8") as f:
             vocab_char_map = {}
             for i, char in enumerate(f):
@@ -122,6 +132,7 @@ def get_tokenizer(dataset_name, tokenizer: str = "pinyin"):
         vocab_size = 256
 
     elif tokenizer == "custom":
+        print('Using vocab.txt from:', dataset_name)
         with open(dataset_name, "r", encoding="utf-8") as f:
             vocab_char_map = {}
             for i, char in enumerate(f):
@@ -135,14 +146,22 @@ def get_tokenizer(dataset_name, tokenizer: str = "pinyin"):
 
 
 def convert_char_to_pinyin(text_list, polyphone=True):
+    if jieba.dt.initialized is False:
+        jieba.default_logger.setLevel(50)  # CRITICAL
+        jieba.initialize()
+
     final_text_list = []
-    god_knows_why_en_testset_contains_zh_quote = str.maketrans(
-        {"“": '"', "”": '"', "‘": "'", "’": "'"}
-    )  # in case librispeech (orig no-pc) test-clean
-    custom_trans = str.maketrans({";": ","})  # add custom trans here, to address oov
+    custom_trans = str.maketrans(
+        {";": ",", "“": '"', "”": '"', "‘": "'", "’": "'"}
+    )  # add custom trans here, to address oov
+
+    def is_chinese(c):
+        return (
+            "\u3100" <= c <= "\u9fff"  # common chinese characters
+        )
+
     for text in text_list:
         char_list = []
-        text = text.translate(god_knows_why_en_testset_contains_zh_quote)
         text = text.translate(custom_trans)
         for seg in jieba.cut(text):
             seg_byte_len = len(bytes(seg, "UTF-8"))
@@ -150,22 +169,21 @@ def convert_char_to_pinyin(text_list, polyphone=True):
                 if char_list and seg_byte_len > 1 and char_list[-1] not in " :'\"":
                     char_list.append(" ")
                 char_list.extend(seg)
-            elif polyphone and seg_byte_len == 3 * len(seg):  # if pure chinese characters
-                seg = lazy_pinyin(seg, style=Style.TONE3, tone_sandhi=True)
-                for c in seg:
-                    if c not in "。，、；：？！《》【】—…":
+            elif polyphone and seg_byte_len == 3 * len(seg):  # if pure east asian characters
+                seg_ = lazy_pinyin(seg, style=Style.TONE3, tone_sandhi=True)
+                for i, c in enumerate(seg):
+                    if is_chinese(c):
                         char_list.append(" ")
-                    char_list.append(c)
-            else:  # if mixed chinese characters, alphabets and symbols
+                    char_list.append(seg_[i])
+            else:  # if mixed characters, alphabets and symbols
                 for c in seg:
                     if ord(c) < 256:
                         char_list.extend(c)
+                    elif is_chinese(c):
+                        char_list.append(" ")
+                        char_list.extend(lazy_pinyin(c, style=Style.TONE3, tone_sandhi=True))
                     else:
-                        if c not in "。，、；：？！《》【】—…":
-                            char_list.append(" ")
-                            char_list.extend(lazy_pinyin(c, style=Style.TONE3, tone_sandhi=True))
-                        else:  # if is zh punc
-                            char_list.append(c)
+                        char_list.append(c)
         final_text_list.append(char_list)
 
     return final_text_list
@@ -183,3 +201,22 @@ def repetition_found(text, length=2, tolerance=10):
         if count > tolerance:
             return True
     return False
+
+
+# get the empirically pruned step for sampling
+
+
+def get_epss_timesteps(n, device, dtype):
+    dt = 1 / 32
+    predefined_timesteps = {
+        5: [0, 2, 4, 8, 16, 32],
+        6: [0, 2, 4, 6, 8, 16, 32],
+        7: [0, 2, 4, 6, 8, 16, 24, 32],
+        10: [0, 2, 4, 6, 8, 12, 16, 20, 24, 28, 32],
+        12: [0, 2, 4, 6, 8, 10, 12, 14, 16, 20, 24, 28, 32],
+        16: [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32],
+    }
+    t = predefined_timesteps.get(n, [])
+    if not t:
+        return torch.linspace(0, 1, n + 1, device=device, dtype=dtype)
+    return dt * torch.tensor(t, device=device, dtype=dtype)
