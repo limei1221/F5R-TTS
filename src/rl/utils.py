@@ -59,8 +59,10 @@ def cal_sim(emb1, emb2):
     return F.cosine_similarity(emb1, emb2)
 
 
-model_asr_dir = "src/rl/SenseVoiceSmall"
-model_asr = AutoModel(model=model_asr_dir, device="cpu", disable_update=True)
+# model_asr_dir = "src/rl/SenseVoiceSmall"
+# model_asr = AutoModel(model=model_asr_dir, device="cpu", disable_update=True)
+model_asr_dir = "FunAudioLLM/SenseVoiceSmall"
+model_asr = AutoModel(model=model_asr_dir, device="cuda:0", hub="hf", disable_update=True)
 
 
 def test_asr():

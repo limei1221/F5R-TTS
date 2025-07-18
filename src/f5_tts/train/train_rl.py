@@ -29,18 +29,16 @@ exp_name = "F5TTS_v1_Base_rl"  # F5TTS_Base | E2TTS_Base
 
 learning_rate = 1e-5
 
-batch_size_per_gpu = 2  # 8 GPUs, 8 * 38400 = 307200, 1500 * 256 / 24000 = 16s
+batch_size_per_gpu = 2
 batch_size_type = "sample"  # "frame" or "sample"
-# batch_size_per_gpu = 1500  # 8 GPUs, 8 * 38400 = 307200, 1500 * 256 / 24000 = 16s
-# batch_size_type = "frame"  # "frame" or "sample"
 min_samples = 2  # min sequences per batch if use frame-wise batch_size.
 max_samples = 4  # max sequences per batch if use frame-wise batch_size.
 grad_accumulation_steps = 2  # note: #updates = #steps / grad_accumulation_steps
 max_grad_norm = 1.0
 
-total_updates = 5000
+total_updates = 1000
 num_warmup_updates = 100  # warmup steps
-save_per_updates = 1  # save checkpoint per steps
+save_per_updates = 100  # save checkpoint per steps
 
 # model params
 wandb_resume_id = None
@@ -48,9 +46,11 @@ model_cls = DiT
 model_cfg = dict(dim=1024, depth=22, heads=16, ff_mult=2, text_dim=512, conv_layers=4)
 
 pretrain_ckpt = "ckpts/F5TTS_v1_Base/model_last.pt"
+# pretrain_ckpt = "/content/drive/MyDrive/F5R-TTS/ckpts/F5TTS_v1_Base/model_last.pt"
 
 # save checkpoint to ckpts/exp_name
 checkpoint_path=str(files("f5_tts").joinpath(f"../../ckpts/{exp_name}"))
+# checkpoint_path=f"/content/drive/MyDrive/F5R-TTS/ckpts/{exp_name}"
 
 # ----------------------------------------------------------------------- #
 
@@ -106,29 +106,29 @@ def main():
     device = trainer.accelerator.device
     print(f"Using device: {device}")
 
-    # from f5_tts.model.dataset import load_dataset
-    # train_dataset = load_dataset(dataset_name, "char", mel_spec_kwargs=mel_spec_kwargs)
+    from f5_tts.model.dataset import load_dataset
+    train_dataset = load_dataset(dataset_name, "char", mel_spec_kwargs=mel_spec_kwargs)
 
     # from datasets import load_dataset
     # train_dataset = load_dataset(
     #     "blabble-io/libritts_r", "clean", split="train.clean.100", streaming=True)
     # train_dataset = StreamingHFDataset(train_dataset, **mel_spec_kwargs)
 
-    from datasets import load_dataset, interleave_datasets
-    en = load_dataset(
-        "amphion/Emilia-Dataset",
-        data_files={"en": "Emilia/EN/*.tar"},
-        split="en",
-        streaming=True
-    )
-    zh = load_dataset(
-        "amphion/Emilia-Dataset",
-        data_files={"zh": "Emilia/ZH/*.tar"},
-        split="zh",
-        streaming=True
-    )
-    train_dataset = interleave_datasets([en, zh], probabilities=[0.5, 0.5], seed=42)
-    train_dataset = StreamingHFDataset(train_dataset)
+    # from datasets import load_dataset, interleave_datasets
+    # en = load_dataset(
+    #     "amphion/Emilia-Dataset",
+    #     data_files={"en": "Emilia/EN/*.tar"},
+    #     split="en",
+    #     streaming=True
+    # )
+    # zh = load_dataset(
+    #     "amphion/Emilia-Dataset",
+    #     data_files={"zh": "Emilia/ZH/*.tar"},
+    #     split="zh",
+    #     streaming=True
+    # )
+    # train_dataset = interleave_datasets([en, zh], probabilities=[0.5, 0.5], seed=42)
+    # train_dataset = StreamingHFDataset(train_dataset)
 
     trainer.train(
         train_dataset,

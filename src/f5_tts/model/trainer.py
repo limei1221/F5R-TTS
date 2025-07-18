@@ -313,7 +313,6 @@ class Trainer:
                     progress_bar.set_postfix(update=str(global_update), loss=loss.item())
 
                 if self.accelerator.is_local_main_process:
-                    print(f"global_update: {global_update}, loss: {loss.item()}")
                     self.accelerator.log(
                         {"loss": loss.item(), "lr": self.scheduler.get_last_lr()[0]}, step=global_update
                     )

@@ -125,7 +125,7 @@ def load_checkpoint(model, ckpt_path, device, dtype=None, use_ema=True):
 
         checkpoint = load_file(ckpt_path)
     else:
-        checkpoint = torch.load(ckpt_path, weights_only=True)
+        checkpoint = torch.load(ckpt_path, weights_only=True, map_location="cpu")
 
     if use_ema:
         print('Loading EMA model...')

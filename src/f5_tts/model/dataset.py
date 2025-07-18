@@ -14,11 +14,11 @@ from tqdm import tqdm
 from f5_tts.model.modules import MelSpec
 from f5_tts.model.utils import default, convert_char_to_pinyin
 
-MIN_DURATION = 1
-MAX_DURATION = 16  # 16 * 24000 / 256 = 1500 frames
-
 # MIN_DURATION = 1
-# MAX_DURATION = 6  # 6 * 24000 / 256 = 562 frames
+# MAX_DURATION = 16
+
+MIN_DURATION = 1
+MAX_DURATION = 5
 
 class HFDataset(Dataset):
     def __init__(

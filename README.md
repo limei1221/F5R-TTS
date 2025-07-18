@@ -26,11 +26,12 @@ conda activate f5r-tts
 pip install -r requirements.txt
 ```
 
+
 ## Inference
 
 ```bash
 python ./src/f5_tts/infer/infer_cli.py \
-  --model F5-TTS \
+  --model F5TTS_v1_Base \
   --ckpt_file "your_model_path" \
   --ref_audio "path_to_reference.wav" \
   --ref_text "reference_text" \
@@ -38,9 +39,12 @@ python ./src/f5_tts/infer/infer_cli.py \
   --output_dir ./tests
 ```
 
+
 ## Training
 
-You need to download [SenseVoice_small](https://huggingface.co/FunAudioLLM/SenseVoiceSmall) and [wespeaker](https://github.com/wenet-e2e/wespeaker/blob/master/docs/pretrained.md) for GRPO phase.
+<!-- You need to download [SenseVoice_small](https://huggingface.co/FunAudioLLM/SenseVoiceSmall) and [wespeaker](https://github.com/wenet-e2e/wespeaker/blob/master/docs/pretrained.md) for GRPO phase. -->
+
+You need to download [wespeaker](https://wenet.org.cn/downloads?models=wespeaker&version=voxblink2_samresnet34.zip) pretrained model and put it under `src/rl/wespeaker/multilingual` directory for GRPO phase.
 
 ```bash
 accelerate config
@@ -54,11 +58,3 @@ accelerate launch src/f5_tts/train/train.py
 # GRPO phase
 accelerate launch src/f5_tts/train/train_rl.py
 ```
-
-## [Evaluation](src/f5_tts/eval)
-Follow the [README.md](src/f5_tts/eval/README.md) file.
-
-## License
-
-Our code is released under MIT License.
-

@@ -29,15 +29,13 @@ exp_name = "F5TTS_v1_Base"  # F5TTS_v1_Base | F5TTS_Base | F5TTS_Small | E2TTS_B
 
 learning_rate = 7.5e-5
 
-# batch_size_per_gpu = 16
-# batch_size_type = "sample"  # "frame" or "sample"
 batch_size_per_gpu = 1500  # 8 GPUs, 8 * 38400 = 307200, 1500 * 256 / 24000 = 16s
 batch_size_type = "frame"  # "frame" or "sample"
-max_samples = 16  # max sequences per batch if use frame-wise batch_size. we set 32 for small models, 64 for base models
-grad_accumulation_steps = 1  # note: #updates = #steps / grad_accumulation_steps
+max_samples = 8  # max sequences per batch if use frame-wise batch_size. we set 32 for small models, 64 for base models
+grad_accumulation_steps = 2  # note: #updates = #steps / grad_accumulation_steps
 max_grad_norm = 1.0
 
-total_updates = 5000
+total_updates = 1000
 num_warmup_updates = 100  # warmup updates
 save_per_updates = 100  # save checkpoint per updates
 
@@ -87,7 +85,7 @@ elif exp_name == "E2TTS_Base":
     repo_name = "E2-TTS"
     ckpt_step = 1200000
 
-# ckpt_file = ""
+# ckpt_file = ""  # train from scratch
 ckpt_file = str(
     cached_path(f"hf://SWivid/{repo_name}/{exp_name}/model_{ckpt_step}.{ckpt_type}")
 )
@@ -119,6 +117,23 @@ def main():
         mel_spec_kwargs=mel_spec_kwargs,
         vocab_char_map=vocab_char_map,
     )
+
+    if ckpt_file != "":
+        ft_params = [
+            "transformer.norm_out.linear.weight",
+            "transformer.norm_out.linear.bias",
+            "transformer.proj_out.weight",
+            "transformer.proj_out.bias",
+            "transformer.proj_out_ln_sig.weight",
+            "transformer.proj_out_ln_sig.bias"
+        ]
+
+        for name, param in model.named_parameters():
+            if name in ft_params:
+                param.requires_grad = True
+                print(f"Trainable: {name}")
+            else:
+                param.requires_grad = False
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable parameters: {trainable_params / 1e6:.2f}M")

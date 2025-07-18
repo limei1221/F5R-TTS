@@ -7,7 +7,7 @@ transformers_stream_generator
 vocos
 wandb
 tqdm>=4.65.0
-numpy<=1.26.4
+numpy>=1.26.4
 librosa
 soundfile
 pydub
@@ -18,9 +18,9 @@ ema_pytorch>=0.5.2
 x_transformers>=1.31.14
 einops
 safetensors
-datasets<=3.6.0
+datasets>=3.6.0
 click
 tomli
-bitsandbytes>0.37.0
+bitsandbytes>=0.42.0
 funasr
 git+https://github.com/wenet-e2e/wespeaker.git
